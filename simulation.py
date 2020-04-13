@@ -1,25 +1,23 @@
-import pandas as pd
 import numpy as np
-from pandas import DataFrame as df
 from heapq import nlargest, nsmallest
-from random import randrange, randint, random
+from random import randrange, randint, random, gauss
 from sklearn import preprocessing
 from math import inf, sqrt
 from matplotlib import pyplot as plt
 from time import time
+from joblib import load
+from sklearn.mixture import GaussianMixture as GMM
 
-df = pd.DataFrame()
+upper_left_lat = 45.211201
+upper_left_lon = -93.550766
+lower_right_lat = 44.761985
+lower_right_lon = -92.818414
 
-# create random population before we get data
-for _ in range(0, 5000):
-    df = df.append([[random(), random()]])
-
-values = df.values
-normalized_values = preprocessing.MinMaxScaler().fit_transform(values)
-df = pd.DataFrame(normalized_values, columns=['lat', 'lon'])
+mn_transit_gmm = load('20_gmm.joblib')
+mn_transit_gmm.set_params(random_state=None)
 
 # Should be even
-POPULATION_SIZE = 100
+POPULATION_SIZE = 1000
 HALF_POPULATION_SIZE = int(POPULATION_SIZE / 2)
 
 ITERATIONS = 100
@@ -28,12 +26,14 @@ MUTATION_RATE = 0.005
 
 RANDOM_PATHS = 100
 
-NUMBER_OF_STATIONS = 6
+NUMBER_OF_STATIONS = 9
 NUMBER_OF_ROUTE_GENES = 30
 NUMBER_OF_ROUTES = 8
 
 WALKING_SPEED = 1
 NETWORK_SPEED = 15
+
+ROUTE_COST_MULTIPLIER = 0 # TODO add in percent cost instead of total distance
 
 def main():
     print("Creating population")
@@ -45,16 +45,37 @@ def main():
     population.plot_best(fitness_function)
     plt.show()
 
+def lat_to_norm(lat):
+    return (lat - lower_right_lat) / (upper_left_lat - lower_right_lat)
+
+def norm_to_lat(lat):
+    return lat * (upper_left_lat - lower_right_lat) + lower_right_lat
+
+def lon_to_norm(lat):
+    return (lat - upper_left_lon) / (lower_right_lon - upper_left_lon)
+
+def norm_to_lon(lat):
+    return lat * (lower_right_lon - upper_left_lon) + upper_left_lon
+
+def truncated_normal():
+    value = -1
+    while value < 0 or value > 1:
+        value = gauss(0.5, 0.1)
+
+    return value
+
 def fitness_function(individual):
     # start_time = time()
     total_distance = 0
-    for _ in range(0, RANDOM_PATHS):
+    routes = mn_transit_gmm.sample(RANDOM_PATHS)[0]
+    for route_number in range(0, RANDOM_PATHS):
+        route = routes[route_number]
         # endpoints = df.sample(2)
-        total_distance = total_distance + individual.to_network().distance_between(Location(random(), random()),Location(random(), random()))
+        total_distance = total_distance + individual.to_network().distance_between(Location(lat_to_norm(route[0]), lon_to_norm(route[1])),Location(lat_to_norm(route[2]), lon_to_norm(route[3])))
 
     # print("fitness function time " + str(time() - start_time))
 
-    return -total_distance
+    return -total_distance - individual.to_network().get_route_cost()
 
 class Population():
     def __init__(self, num_individuals):
@@ -88,14 +109,10 @@ class Population():
 
     def plot_best(self, fitness_function):
         scores = {}
-        raw_scores = []
-        total_score = 0
         for i in range(0, len(self._population)):
             individual = self._population[i]
             score = fitness_function(individual)
             scores[individual] = score
-            total_score += score
-            raw_scores.append(score)
 
         biggest = list(nlargest(1, scores, key=scores.get))[0]
 
@@ -150,12 +167,7 @@ class LocationGene():
         return Location(self._lat, self._lon)
 
     def mutate(self):
-        lat_lon_decider = randint(0, 1)
-        new_coordinate = random()
-        if lat_lon_decider == 0:
-            return LocationGene(new_coordinate, self._lon)
-        else:
-            return LocationGene(self._lat, new_coordinate)
+        return LocationGene(self._lat + gauss(0, 0.05), self._lon + gauss(0, 0.05))
 
 class SegmentGene():
 
@@ -181,24 +193,23 @@ class Network():
         for location in self._locations:
             self._neighbors[location] = []
 
+        self._segments = []
         num_segments_used = 0
         for segment in segments:
             if num_segments_used >= NUMBER_OF_ROUTES:
                 break
 
-            neighbor_list = self._neighbors[segment.get_start(self._locations)]
-            end = segment.get_end(self._locations)
-            if neighbor_list.count(end) > 0:
+            start_location = segment.get_start(self._locations)
+            end_location = segment.get_end(self._locations)
+            start_neighbors = self._neighbors[start_location]
+            if start_neighbors.count(end_location) > 0:
                 continue
 
-            neighbor_list.append(end)
+            end_neighbors = self._neighbors[end_location]
+            end_neighbors.append(start_location)
+
             num_segments_used = num_segments_used + 1
-
-        for location in self._neighbors.keys():
-            if len(self._neighbors[location]) == 0:
-                self._locations.remove(location)
-
-        self._segments = segments
+            self._segments.append(segment)
 
     def distance_between(self, start, stop):
         # most accurate is to compare every pair of points but that takes too long as it multiplies the problem by v^2
@@ -215,7 +226,7 @@ class Network():
         shortest_stop = None
         shortest_stop_dist = inf
         for location in self._locations:
-            dist = start.distance_to(location)
+            dist = stop.distance_to(location)
             if dist < shortest_stop_dist:
                 shortest_stop = location
                 shortest_stop_dist = dist
@@ -230,6 +241,8 @@ class Network():
 
     def travel_time(self, start, start_idx, path_dist, stop_idx, stop):
         network_time = path_dist / NETWORK_SPEED
+        if network_time == inf:
+            return start.distance_to(stop) / WALKING_SPEED
 
         to_start_time = start.distance_to(self._locations[start_idx]) / WALKING_SPEED
         to_stop_time = stop.distance_to(self._locations[stop_idx]) / WALKING_SPEED
@@ -267,6 +280,13 @@ class Network():
 
         return inf
 
+    def get_route_cost(self):
+        cost = 0
+        for segment in self._segments:
+            cost += segment.get_start(self._locations).distance_to(segment.get_end(self._locations))
+
+        return cost * ROUTE_COST_MULTIPLIER
+
     def plot(self):
         for location in self._orig_locations:
             plt.plot(location.get_lat(), location.get_lon(), location.get_lat(), location.get_lon(), marker='o', color='red')
@@ -276,7 +296,7 @@ class Network():
             end = segment.get_end(self._orig_locations)
 
             plt.plot([start.get_lat(), end.get_lat()], [start.get_lon(), end.get_lon()], marker='o', color='red')
-            plt.plot([segment._start.get_lat(), segment._end.get_lat()], [segment._start.get_lon(), segment._end.get_lon()], marker='o', color='green')
+            # plt.plot([segment._start.get_lat(), segment._end.get_lat()], [segment._start.get_lon(), segment._end.get_lon()], marker='o', color='green')
 
 class Segment():
     def __init__(self, start, end):
